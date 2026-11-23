@@ -1,0 +1,12 @@
+streamlit>=1.54,<2
+pandas>=2.2,<3
+numpy>=1.26
+gpxpy>=1.6,<2
+requests>=2.31
+urllib3>=2
+altair>=5,<7
+pydeck>=0.9,<1
+matplotlib>=3.8
+openpyxl>=3.1
+supabase>=2.10,<3
+python-dotenv>=1.0

@@ -9,6 +9,7 @@ A failed run sets route_status = 'failed' and logs the error.
 Credentials: SUPABASE_URL and SUPABASE_KEY (secret/service_role key), from the environment or `.env`.
 """
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import logging
@@ -16,6 +17,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
 
 APP_DIR = Path(__file__).resolve().parent
@@ -28,13 +30,14 @@ from processing.data_handler import POINT_COLUMNS, SEGMENT_COLUMNS, data_handler
 from processing.elev_profile import (  # noqa: E402
     find_peaks_and_valleys, load_elevation_profile, load_saved_elevation_fit, select_cosine_bic,
 )
-from processing.processing import parse_gpx, route_frame, run_lookup  # noqa: E402
+from processing.processing import job_state, parse_gpx, route_frame, run_lookup  # noqa: E402
 from processing.risk_analysis import calculate_risks, summarize_segment_risks  # noqa: E402
 from processing.segmentation import suggest_segments  # noqa: E402
 from processing.smoothing import smooth_race  # noqa: E402
 from processing.supabase_reader import connect, download_gpx  # noqa: E402
 
 POLL_SECONDS = 5
+PROGRESS_SECONDS = 30
 UPLOAD_CHUNK = 1000
 INTEGER_COLUMNS = {
     "route_order", "path_id", "traffic_year", "lane_count", "functional_road_class", "cycle_lane_count",
@@ -60,6 +63,32 @@ def records(frame, race_id):
     return rows.to_dict("records")
 
 
+@contextmanager
+def log_lookup_progress(db, race_id):
+    """Log road lookup progress from a helper thread, since run_lookup blocks for hours on large routes."""
+    stop = threading.Event()
+    started = time.monotonic()
+
+    def report():
+        while not stop.wait(PROGRESS_SECONDS):
+            state = job_state(db, race_id)
+            if not state or not state["total"]:
+                continue
+            done, total = state["done"], state["total"]
+            elapsed = time.monotonic() - started
+            eta = f", ~{elapsed / done * (total - done) / 60:,.0f} min left" if done else ""
+            log.info("Road lookup: %s/%s points (%.1f%%), %.0f min elapsed%s",
+                     f"{done:,}", f"{total:,}", 100 * done / total, elapsed / 60, eta)
+
+    thread = threading.Thread(target=report, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
+
+
 def process_gpx(race, content):
     """Run the full dashboard pipeline on one GPX; return (route_data, route_segments, gpx_hash)."""
     with tempfile.TemporaryDirectory() as folder:
@@ -69,7 +98,9 @@ def process_gpx(race, content):
         db.save_upload(local_id, race.get("gpx_filename") or f"{race['race_id']}.gpx", content, digest,
                        parse_gpx(content))
         log.info("Road lookup: %s GPX points", f"{len(db.route_points(local_id)):,}")
-        run_lookup(db, local_id)
+        with log_lookup_progress(db, local_id):
+            run_lookup(db, local_id)
+        log.info("Road lookup finished")
         log.info("Smoothing roads")
         smooth_race(db, local_id)
         log.info("Fitting elevation profile")

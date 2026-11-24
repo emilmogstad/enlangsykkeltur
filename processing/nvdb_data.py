@@ -20,7 +20,18 @@ DATASETS = (
     ("accident", 570, True),
     ("cattle_grid", 22, True),
     ("speed_bump", 103, True),
+    ("surface", 241, False),
 )
+SURFACE_LAYER = 8741
+SURFACE_MATERIAL = 1216
+# NVDB Massetype values that are not bitumen-bound; every other Massetype is an asphalt or sealed surface.
+SURFACE_CATEGORIES = {
+    "Grus": "Grus",
+    "Betong": "Betong", "Valsebetong": "Betong", "Betongdekke, uarmert": "Betong", "Betongelementer": "Betong",
+    "Belegningsstein": "Stein", "Brostein/Gatestein": "Stein",
+    "Tre (bru)": "Annet", "Stålgitter (bru)": "Annet",
+}
+SURFACE_COLUMNS = ["surface_type", "surface_material"]
 SUMMARY_PROPERTIES = {
     "traffic_aadt": ("traffic", 4623),
     "traffic_long_vehicles_pct": ("traffic", 4624),
@@ -44,7 +55,8 @@ DATASET_COLUMNS = [
     "traffic_count", "speed_limit_count", "speed_limit_object_ids", "tunnel_count", "bridge_count",
     "accident_count", "cattle_grid_count", "speed_bump_count", "speed_bump_object_ids",
 ]
-NVDB_COLUMNS = ["nvdb_reference", "nvdb_lookup_status", *SUMMARY_PROPERTIES, *TEXT_PROPERTIES, *DATASET_COLUMNS]
+NVDB_COLUMNS = ["nvdb_reference", "nvdb_lookup_status", *SUMMARY_PROPERTIES, *TEXT_PROPERTIES, *DATASET_COLUMNS,
+                *SURFACE_COLUMNS]
 NVDB_NUMERIC = {
     "traffic_aadt", "traffic_long_vehicles_pct", "traffic_year", "speed_limit_kmh",
     "calculated_road_width_m", "lane_count", "functional_road_class",
@@ -93,8 +105,19 @@ def lookup_objects(session: requests.Session, object_type: int, reference: str) 
     return list({record["id"]: record for record in objects}.values())
 
 
+def summarize_surface(records: list[dict]) -> dict:
+    """Describe the top (wearing) layer; roads without a Vegdekke object, e.g. most private roads, are Ukjent."""
+    layers = [{item["id"]: item.get("verdi") for item in record.get("egenskaper", [])} for record in records]
+    top = [layer for layer in layers if layer.get(SURFACE_LAYER) != "Bindlag"] or layers
+    materials = sorted({str(layer[SURFACE_MATERIAL]) for layer in top if layer.get(SURFACE_MATERIAL)})
+    types = sorted({SURFACE_CATEGORIES.get(material, "Asfalt") for material in materials})
+    return {"surface_type": "; ".join(types) or "Ukjent", "surface_material": "; ".join(materials) or None}
+
+
 def summarize_records(datasets: dict[str, list[dict]]) -> dict:
     result = {}
+    if "surface" in datasets:
+        result.update(summarize_surface(datasets["surface"]))
     for column in DATASET_COLUMNS:
         if column.endswith("_count"):
             records = datasets.get(column.removesuffix("_count"))

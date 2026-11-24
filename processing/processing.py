@@ -224,7 +224,7 @@ def _lookup_worker(db_path, race_id, digest, lookup_properties):
         pool = ThreadPoolExecutor(max_workers=LOOKUP_WORKERS, thread_name_prefix="nvdb-request")
         with requests.Session() as session:
             adapter = HTTPAdapter(pool_maxsize=LOOKUP_WORKERS, max_retries=Retry(
-                total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504]))
+                total=6, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504]))
             session.mount("https://", adapter)
             # Requests within a batch run in parallel; rows are assembled in order so counters stay sequential.
             for start in range(0, len(rows), LOOKUP_BATCH):

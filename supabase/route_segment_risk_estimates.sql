@@ -1,4 +1,5 @@
--- Segment risk estimates calculated from route_data and route_segments. This view is the source of truth for
+-- Segment risk estimates calculated from route_data, effective_route_roads (road attributes, and municipality and
+-- county names from contacts) and route_segments. Run effective_route_roads.sql first. This view is the source of truth for
 -- segment risk; the route-processing worker only uploads route points and segments.
 -- Crash risk uses elevation sections rebuilt from route_data.elevation_extremum (fitted extrema stored at their
 -- nearest GPX point).
@@ -14,18 +15,16 @@ with points as (
         p.distance_cum_km::double precision as distance_cum_km,
         p.elevation_extremum,
         p.fitted_elevation_m::double precision as fitted_elevation_m,
-        -- Smoothed points use their donor point's road attributes, as in the dashboard.
-        (case when p.smoothed_source_route_order is null then p.traffic_aadt else d.traffic_aadt end)::double precision
-            as traffic_aadt,
-        (case when p.smoothed_source_route_order is null then p.traffic_long_vehicles_pct
-              else d.traffic_long_vehicles_pct end)::double precision as traffic_long_vehicles_pct,
-        (case when p.smoothed_source_route_order is null then p.speed_limit_kmh else d.speed_limit_kmh end)::double precision
-            as speed_limit_kmh,
-        (case when p.smoothed_source_route_order is null then p.functional_road_class
-              else d.functional_road_class end)::double precision as functional_road_class
+        -- Road attributes (smoothed road and donor values) come from effective_route_roads.
+        e.traffic_aadt::double precision as traffic_aadt,
+        e.traffic_long_vehicles_pct::double precision as traffic_long_vehicles_pct,
+        e.speed_limit_kmh::double precision as speed_limit_kmh,
+        e.functional_road_class::double precision as functional_road_class,
+        e.vei_id,
+        nullif(trim(e.kommunename), '') as kommunename,
+        nullif(trim(e.fylke), '') as fylke
     from public.route_data p
-    left join public.route_data d
-        on d.race_id = p.race_id and d.route_order = p.smoothed_source_route_order
+    join public.effective_route_roads e on e.race_id = p.race_id and e.route_order = p.route_order
 ),
 route_bounds as (
     select race_id, min(route_order) as first_order, max(route_order) as last_order
@@ -83,6 +82,9 @@ included_points as (
         p.route_order,
         p.elevation_m,
         p.distance_cum_km,
+        p.vei_id,
+        p.kommunename,
+        p.fylke,
         case
             when s.rise_m >= 0 then 0
             when 100 * abs(s.rise_m) > 80000 then 5
@@ -121,6 +123,9 @@ traffic_inputs as (
         p.distance_cum_km,
         p.crash_risk,
         p.first_distance_km,
+        p.vei_id,
+        p.kommunename,
+        p.fylke,
         coalesce(p.traffic_aadt, c.traffic_aadt) as traffic_aadt,
         coalesce(p.traffic_long_vehicles_pct, c.traffic_long_vehicles_pct) as traffic_long_vehicles_pct,
         coalesce(p.speed_limit_kmh, c.speed_limit_kmh) as speed_limit_kmh,
@@ -136,9 +141,9 @@ help_points as (
         *,
         max(case when traffic_aadt >= 1000 then distance_cum_km end)
             over (partition by race_id order by route_order rows unbounded preceding) as previous_help_km,
+        -- Reverse order keeps the frame start fixed; a moving frame start makes min() rescan every row.
         min(case when traffic_aadt >= 1000 then distance_cum_km end)
-            over (partition by race_id order by route_order rows between current row and unbounded following)
-            as next_help_km
+            over (partition by race_id order by route_order desc rows unbounded preceding) as next_help_km
     from traffic_inputs
 ),
 help_distances as (
@@ -158,6 +163,7 @@ point_risks as (
         route_order,
         -- least/greatest ignore nulls in Postgres, so test missing traffic inputs explicitly.
         case
+            when vei_id like 'EV%' or vei_id like 'RV%' then 5
             when traffic_aadt is null or traffic_long_vehicles_pct is null or speed_limit_kmh is null then 0
             else least(5, 2 * (least(traffic_aadt / 10000, 5) + least(traffic_long_vehicles_pct / 20, 5)
                                + least(speed_limit_kmh / 80, 5)))
@@ -168,7 +174,10 @@ point_risks as (
         -- Avstand til hjelp: 0 on a busy road, rising linearly to 5 at 20 km from one.
         coalesce(least(5, 5 * help_km / 20), 5) as remoteness_risk,
         help_km,
-        traffic_estimated
+        traffic_estimated,
+        vei_id,
+        kommunename,
+        fylke
     from help_distances
 ),
 aggregate_risks as (
@@ -218,8 +227,33 @@ segment_risks as (
         max(case when peak_rank = 1 then fatigue_risk end) as peak_fatigue_risk,
         max(case when peak_rank = 1 then remoteness_risk end) as peak_remoteness_risk,
         100.0 * avg(case when traffic_estimated then 1 else 0 end) as traffic_estimated_pct,
-        max(help_km) as max_help_km
+        max(help_km) as max_help_km,
+        -- European (EV) and national (RV) roads; smoothed points use their smoothed road.
+        coalesce(bool_or(vei_id like 'EV%' or vei_id like 'RV%'), false) as has_ev_rv,
+        string_agg(distinct vei_id, ', ' order by vei_id)
+            filter (where vei_id like 'EV%' or vei_id like 'RV%') as ev_rv_roads
     from segment_points
+    group by race_id, segment
+),
+segment_kommuner as (
+    -- Municipalities and counties in the order the route enters them.
+    select race_id, segment, string_agg(kommunename, ', ' order by first_order) as kommunename
+    from (
+        select race_id, segment, kommunename, min(route_order) as first_order
+        from segment_points
+        where kommunename is not null
+        group by race_id, segment, kommunename
+    ) k
+    group by race_id, segment
+),
+segment_fylker as (
+    select race_id, segment, string_agg(fylke, ', ' order by first_order) as fylke
+    from (
+        select race_id, segment, fylke, min(route_order) as first_order
+        from segment_points
+        where fylke is not null
+        group by race_id, segment, fylke
+    ) f
     group by race_id, segment
 ),
 segment_bounds as (
@@ -309,6 +343,12 @@ select
     r.peak_fatigue_risk,
     r.peak_remoteness_risk,
     r.traffic_estimated_pct,
-    r.max_help_km
+    r.max_help_km,
+    coalesce(r.has_ev_rv, false) as has_ev_rv,
+    r.ev_rv_roads,
+    k.kommunename,
+    f.fylke
 from segment_measures s
-left join segment_risks r on r.race_id = s.race_id and r.segment = s.segment;
+left join segment_risks r on r.race_id = s.race_id and r.segment = s.segment
+left join segment_kommuner k on k.race_id = s.race_id and k.segment = s.segment
+left join segment_fylker f on f.race_id = s.race_id and f.segment = s.segment;

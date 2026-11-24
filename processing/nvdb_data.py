@@ -151,24 +151,45 @@ def summarize_records(datasets: dict[str, list[dict]]) -> dict:
     return result
 
 
-def lookup_route_data(session: requests.Session, kortform: str | None, kommunenr: str | int | float | None) -> dict:
+def _plan_route_data(kortform, kommunenr):
+    """Return (result, queries); queries are (dataset, object_type, reference) still to fetch."""
     result = dict.fromkeys(NVDB_COLUMNS)
     if not kortform or not kommunenr:
         result["nvdb_lookup_status"] = "no_road_reference"
-        return result
+        return result, []
     municipality = normalize_municipality_number(kommunenr)
     reference = f"{municipality} {kortform}"
     result["nvdb_reference"] = reference
     match = REFERENCE_PATTERN.fullmatch(kortform)
     if match is None:
         result["nvdb_lookup_status"] = "reference_without_metres"
-        return result
+        return result, []
     prefix, metre = match.group(1), int(match.group(2))
     nearby = f"{municipality} {prefix} m{max(0, metre - NEARBY_METRES)}-{metre + NEARBY_METRES}"
-    datasets = {}
-    for name, object_type, use_interval in DATASETS:
-        records = lookup_objects(session, object_type, nearby if use_interval else reference)
-        datasets[name] = records
-    result.update(summarize_records(datasets))
-    result["nvdb_lookup_status"] = "complete"
+    return result, [(name, object_type, nearby if use_interval else reference)
+                    for name, object_type, use_interval in DATASETS]
+
+
+def _finish_route_data(result, datasets):
+    if datasets is not None:
+        result.update(summarize_records(datasets))
+        result["nvdb_lookup_status"] = "complete"
     return result
+
+
+def lookup_route_data(session: requests.Session, kortform: str | None, kommunenr: str | int | float | None) -> dict:
+    result, queries = _plan_route_data(kortform, kommunenr)
+    datasets = {name: lookup_objects(session, object_type, reference) for name, object_type, reference in queries}
+    return _finish_route_data(result, datasets if queries else None)
+
+
+def lookup_route_data_many(session: requests.Session, keys, pool) -> dict:
+    """lookup_route_data for many (kortform, kommunenr) keys, running every NVDB request in `pool`."""
+    plans = {key: _plan_route_data(*key) for key in keys}
+    futures = {(key, name): pool.submit(lookup_objects, session, object_type, reference)
+               for key, (_, queries) in plans.items() for name, object_type, reference in queries}
+    datasets = {}
+    for (key, name), future in futures.items():
+        datasets.setdefault(key, {})[name] = future.result()
+    return {key: _finish_route_data(result, datasets.get(key) if queries else None)
+            for key, (result, queries) in plans.items()}

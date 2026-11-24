@@ -2,8 +2,9 @@
 
 Every 5 seconds, look for a racemaster row with route_status = 'not_ready'. For such a race:
 clear its route_data and route_segments, set it to 'processing', download its GPX from Supabase
-Storage, run road lookup, smoothing, elevation fit, segmentation and segment risks (the same code
-as the dashboard, in a temporary SQLite database), upload the results and set it to 'ready'.
+Storage, run road lookup, smoothing, elevation fit and segmentation (the same code as the dashboard,
+in a temporary SQLite database), upload the results and set it to 'ready'. Segment risks are calculated
+by the Supabase view route_segment_risk_estimates (supabase/route_segment_risk_estimates.sql).
 A failed run sets route_status = 'failed' and logs the error.
 
 Credentials: SUPABASE_URL and SUPABASE_KEY (secret/service_role key), from the environment or `.env`.
@@ -31,7 +32,6 @@ from processing.elev_profile import (  # noqa: E402
     find_peaks_and_valleys, load_elevation_profile, load_saved_elevation_fit, select_cosine_bic,
 )
 from processing.processing import job_state, parse_gpx, route_frame, run_lookup  # noqa: E402
-from processing.risk_analysis import calculate_risks, summarize_segment_risks  # noqa: E402
 from processing.segmentation import suggest_segments  # noqa: E402
 from processing.smoothing import smooth_race  # noqa: E402
 from processing.supabase_reader import connect, download_gpx  # noqa: E402
@@ -39,12 +39,17 @@ from processing.supabase_reader import connect, download_gpx  # noqa: E402
 POLL_SECONDS = 5
 PROGRESS_SECONDS = 30
 UPLOAD_CHUNK = 1000
+# Needed by the local pipeline (lookup resume, NVDB details) but not stored in Supabase route_data.
+LOCAL_ONLY_POINT_COLUMNS = {
+    "property_lookup_status", "excluded", "speed_bump_object_ids", "speed_limit_object_ids", "speed_limit_count",
+}
+UPLOAD_POINT_COLUMNS = [c for c in POINT_COLUMNS if c not in LOCAL_ONLY_POINT_COLUMNS]
 INTEGER_COLUMNS = {
     "route_order", "path_id", "traffic_year", "lane_count", "functional_road_class", "cycle_lane_count",
-    "traffic_count", "speed_limit_count", "tunnel_count", "bridge_count", "accident_count",
-    "cattle_grid_count", "speed_bump_count", "smoothed_source_route_order", "segment", "risk_peak_route_order",
+    "traffic_count", "tunnel_count", "bridge_count", "accident_count",
+    "cattle_grid_count", "speed_bump_count", "smoothed_source_route_order", "segment",
 }
-BOOLEAN_COLUMNS = {"jump_flag", "excluded"}
+BOOLEAN_COLUMNS = {"jump_flag"}
 log = logging.getLogger("worker")
 
 
@@ -111,17 +116,14 @@ def process_gpx(race, content):
         extrema = find_peaks_and_valleys(coefficients, float(profile["route_order"].min()),
                                          float(profile["route_order"].max()))
         db.save_elevation_fit(local_id, digest, coefficients.tolist(), fitted, extrema)
-        log.info("Segmentation and risk analysis")
-        fitted, extrema, sections = load_saved_elevation_fit(db, local_id, digest)
+        log.info("Segmentation")
+        fitted, extrema, _ = load_saved_elevation_fit(db, local_id, digest)
         route = route_frame(db, local_id)
         db.save_segments(local_id, db.race(local_id)["revision"], suggest_segments(fitted, extrema, route))
-        segments = db.segments(local_id)
-        summary = summarize_segment_risks(segments, calculate_risks(route, sections))
-        db.save_segment_risks(local_id, db.race(local_id)["revision"], summary.assign(segment=segments["segment"]))
         with db.connection() as connection:
             points = pd.read_sql_query("SELECT * FROM route_data WHERE race_id=? ORDER BY route_order",
                                        connection, params=(local_id,))
-        return points[POINT_COLUMNS], db.segments(local_id)[SEGMENT_COLUMNS], digest
+        return points[UPLOAD_POINT_COLUMNS], db.segments(local_id)[SEGMENT_COLUMNS], digest
 
 
 def clear_race(client, race_id):

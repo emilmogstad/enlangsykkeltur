@@ -3,10 +3,10 @@
 Every 5 seconds, look for a racemaster row waiting in one of these route_status values and run the
 next step (the same code as the dashboard, in a temporary SQLite database):
 
-    not_ready    -> road lookup, upload route_data              -> lookup_done
-    lookup_done  -> smoothing, replace route_data               -> smoothing
+    not_ready    -> elevation fit, road lookup, upload route_data         -> lookup_done
+    lookup_done  -> elevation fit, smoothing, replace route_data         -> smoothing
     smoothing    -> elevation fit and segmentation, replace
-                    route_data and upload route_segments        -> ready
+                    route_data and upload route_segments                 -> ready
 
 The status shows the last finished step, so a race moves on until it is 'ready'. While a step runs the
 status is 'processing'. To redo the later steps, set the status manually (e.g. 'lookup_done' keeps the
@@ -137,6 +137,16 @@ def local_points(db, local_id):
     return points[UPLOAD_POINT_COLUMNS]
 
 
+def fit_elevation(db, local_id, digest):
+    log.info("Fitting elevation profile")
+    profile = load_elevation_profile(local_id, db)
+    fitted = select_cosine_bic(profile)
+    coefficients = fitted.attrs["cosine_coefficients"]
+    extrema = find_peaks_and_valleys(coefficients, float(profile["route_order"].min()),
+                                     float(profile["route_order"].max()))
+    db.save_elevation_fit(local_id, digest, coefficients.tolist(), fitted, extrema)
+
+
 def run_stage(client, race, stage):
     """Run the step after `stage`; upload its result and return the new status."""
     race_id = race["race_id"]
@@ -144,6 +154,8 @@ def run_stage(client, race, stage):
     log.info("Downloaded %s (%s KB)", path, f"{len(content) / 1024:,.0f}")
     db, local_id, digest = new_local_race(race, content)
     try:
+        # The fit only depends on the GPX; run it in every step so each route_data upload has it.
+        fit_elevation(db, local_id, digest)
         if stage == "not_ready":
             clear_race(client, race_id)
             log.info("Road lookup: %s GPX points", f"{len(db.route_points(local_id)):,}")
@@ -161,13 +173,6 @@ def run_stage(client, race, stage):
             replace_race(client, race_id, local_points(db, local_id))
             set_status(client, race_id, "smoothing")
             return "smoothing"
-        log.info("Fitting elevation profile")
-        profile = load_elevation_profile(local_id, db)
-        fitted = select_cosine_bic(profile)
-        coefficients = fitted.attrs["cosine_coefficients"]
-        extrema = find_peaks_and_valleys(coefficients, float(profile["route_order"].min()),
-                                         float(profile["route_order"].max()))
-        db.save_elevation_fit(local_id, digest, coefficients.tolist(), fitted, extrema)
         log.info("Segmentation")
         fitted, extrema, _ = load_saved_elevation_fit(db, local_id, digest)
         route = route_frame(db, local_id)

@@ -53,14 +53,15 @@ def now():
 
 
 def records(frame, race_id):
-    """JSON-safe rows: None for missing values, Python int/bool/float matching the Supabase column types."""
-    rows = frame.astype(object).where(frame.notna(), None)
-    for column in rows.columns:
-        convert = int if column in INTEGER_COLUMNS else bool if column in BOOLEAN_COLUMNS else None
-        if convert:
-            rows[column] = [None if value is None else convert(value) for value in rows[column]]
-    rows["race_id"] = race_id
-    return rows.to_dict("records")
+    """JSON-safe rows; convert in dictionaries so pandas cannot coerce None back to NaN."""
+    rows = frame.astype(object).where(frame.notna(), None).to_dict("records")
+    for row in rows:
+        for column, value in row.items():
+            convert = int if column in INTEGER_COLUMNS else bool if column in BOOLEAN_COLUMNS else None
+            if convert and value is not None:
+                row[column] = convert(value)
+        row["race_id"] = race_id
+    return rows
 
 
 @contextmanager

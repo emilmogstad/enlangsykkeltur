@@ -5,7 +5,7 @@ import streamlit as st
 
 from processing import excel_bytes, route_frame
 from processing.elev_profile import load_saved_elevation_fit
-from processing.segmentation import suggest_segments
+from processing.segmentation import segment_details, suggest_segments
 from ui import context
 
 st.title("Segmentation")
@@ -32,9 +32,10 @@ except ValueError as error:
 	st.info(str(error))
 	st.stop()
 
-st.caption("Only HC, Cat 1 and Cat 2 climbs and descents create elevation boundaries and are kept whole. Outside them, "
-	"split at fylke/municipality borders and at the start/end of continuous private-road stretches longer than "
-	"2 km (smoothed IDs starting with P or S). Regenerating segments clears their saved risks.")
+st.caption("Only HC, Cat 1 and Cat 2 climbs and descents create elevation boundaries and are kept whole. Runs of at "
+	"least 4 points on one EV/RV road become their own segment, named by road, and are not split by other borders. "
+	"Elsewhere, split at fylke/municipality borders and at the start/end of continuous private-road (smoothed IDs "
+	"starting with P or S) and non-asphalt surface stretches longer than 2 km.")
 _, fitted, extrema, _ = result
 segments = db.segments(race_id)
 if st.button("Generate and save segments", icon=":material/segment:"):
@@ -44,7 +45,12 @@ if st.button("Generate and save segments", icon=":material/segment:"):
 	except (ValueError, sqlite3.Error) as error:
 		st.error(str(error))
 if segments.empty:
-	st.info("Generate and save the segments before calculating segment risks.")
+	st.info("Generate and save the segments to review them.")
+	st.stop()
+try:
+	segments = segment_details(fitted, route, segments)
+except ValueError as error:
+	st.error(f"Could not measure the saved segments: {error}")
 	st.stop()
 
 metrics = st.columns(3)

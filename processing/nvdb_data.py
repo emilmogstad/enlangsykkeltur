@@ -64,6 +64,10 @@ NVDB_NUMERIC = {
     *(column for column in DATASET_COLUMNS if column.endswith("_count")),
 }
 REFERENCE_PATTERN = re.compile(r"(.+) m(\d+)")
+# kortform of an object's location: a point (m27) or a stretch (m313-4323).
+LOCATION_PATTERN = re.compile(r"(.+) m(\d+)(?:-(\d+))?")
+ROADNAME_TYPE = 538
+ROADNAME_PROPERTY = 4589
 
 
 def normalize_municipality_number(value: str | int | float) -> str:
@@ -76,11 +80,12 @@ def normalize_municipality_number(value: str | int | float) -> str:
     return f"{number:04d}"
 
 
-def lookup_objects(session: requests.Session, object_type: int, reference: str) -> list[dict]:
+def lookup_objects(session: requests.Session, object_type: int, reference: str,
+                   include: str = "egenskaper", page_size: int = 100) -> list[dict]:
     params = {
         "vegsystemreferanse": reference,
-        "inkluder": "egenskaper",
-        "antall": 100,
+        "inkluder": include,
+        "antall": page_size,
     }
     objects = []
     seen_starts = set()
@@ -151,45 +156,93 @@ def summarize_records(datasets: dict[str, list[dict]]) -> dict:
     return result
 
 
-def _plan_route_data(kortform, kommunenr):
-    """Return (result, queries); queries are (dataset, object_type, reference) still to fetch."""
+def _parse_reference(kortform, kommunenr):
+    """Return (empty result, (municipality, prefix, metre) or None if the reference cannot be looked up)."""
     result = dict.fromkeys(NVDB_COLUMNS)
     if not kortform or not kommunenr:
         result["nvdb_lookup_status"] = "no_road_reference"
-        return result, []
+        return result, None
     municipality = normalize_municipality_number(kommunenr)
-    reference = f"{municipality} {kortform}"
-    result["nvdb_reference"] = reference
+    result["nvdb_reference"] = f"{municipality} {kortform}"
     match = REFERENCE_PATTERN.fullmatch(kortform)
     if match is None:
         result["nvdb_lookup_status"] = "reference_without_metres"
-        return result, []
-    prefix, metre = match.group(1), int(match.group(2))
-    nearby = f"{municipality} {prefix} m{max(0, metre - NEARBY_METRES)}-{metre + NEARBY_METRES}"
-    return result, [(name, object_type, nearby if use_interval else reference)
-                    for name, object_type, use_interval in DATASETS]
+        return result, None
+    return result, (municipality, match.group(1), int(match.group(2)))
 
 
 def _finish_route_data(result, datasets):
-    if datasets is not None:
-        result.update(summarize_records(datasets))
-        result["nvdb_lookup_status"] = "complete"
+    result.update(summarize_records(datasets))
+    result["nvdb_lookup_status"] = "complete"
     return result
 
 
 def lookup_route_data(session: requests.Session, kortform: str | None, kommunenr: str | int | float | None) -> dict:
-    result, queries = _plan_route_data(kortform, kommunenr)
-    datasets = {name: lookup_objects(session, object_type, reference) for name, object_type, reference in queries}
-    return _finish_route_data(result, datasets if queries else None)
+    result, location = _parse_reference(kortform, kommunenr)
+    if location is None:
+        return result
+    municipality, prefix, metre = location
+    nearby = f"{municipality} {prefix} m{max(0, metre - NEARBY_METRES)}-{metre + NEARBY_METRES}"
+    return _finish_route_data(result, {
+        name: lookup_objects(session, object_type, nearby if use_interval else result["nvdb_reference"])
+        for name, object_type, use_interval in DATASETS})
+
+
+def _covers(record, prefix, low, high):
+    for entry in record.get("lokasjon", {}).get("vegsystemreferanser", []):
+        match = LOCATION_PATTERN.fullmatch(entry.get("kortform", ""))
+        if match and match.group(1) == prefix:
+            start = int(match.group(2))
+            if start <= high and int(match.group(3) or start) >= low:
+                return True
+    return False
+
+
+def _road_names(records):
+    names = {str(item.get("verdi") or "").strip() for record in records for item in record.get("egenskaper", [])
+             if item["id"] == ROADNAME_PROPERTY}
+    return "; ".join(sorted(name for name in names if name)) or None
 
 
 def lookup_route_data_many(session: requests.Session, keys, pool) -> dict:
-    """lookup_route_data for many (kortform, kommunenr) keys, running every NVDB request in `pool`."""
-    plans = {key: _plan_route_data(*key) for key in keys}
-    futures = {(key, name): pool.submit(lookup_objects, session, object_type, reference)
-               for key, (_, queries) in plans.items() for name, object_type, reference in queries}
-    datasets = {}
-    for (key, name), future in futures.items():
-        datasets.setdefault(key, {})[name] = future.result()
-    return {key: _finish_route_data(result, datasets.get(key) if queries else None)
-            for key, (result, queries) in plans.items()}
+    """lookup_route_data and road name for many (kortform, kommunenr) keys; returns {key: (result, road_name)}.
+
+    Each dataset is fetched once per road stretch (same reference apart from the metre) covering all the
+    keys' metres, and every point's objects are picked from it locally by their location's metre range.
+    The requests run in `pool`.
+    """
+    parsed = {key: _parse_reference(*key) for key in keys}
+    ranges = {}
+    for _, location in parsed.values():
+        if location:
+            municipality, prefix, metre = location
+            low, high = ranges.get((municipality, prefix), (metre, metre))
+            ranges[(municipality, prefix)] = (min(low, metre), max(high, metre))
+    queries = [(name, object_type) for name, object_type, _ in DATASETS] + [("road_name", ROADNAME_TYPE)]
+    futures = {
+        (stretch, name): pool.submit(
+            lookup_objects, session, object_type,
+            f"{stretch[0]} {stretch[1]} m{max(0, low - NEARBY_METRES)}-{high + NEARBY_METRES}",
+            "egenskaper,lokasjon", 1000)
+        for stretch, (low, high) in ranges.items() for name, object_type in queries
+    }
+    # References without metres keep the old road name lookup at the exact reference.
+    name_futures = {key: pool.submit(lookup_objects, session, ROADNAME_TYPE, result["nvdb_reference"])
+                    for key, (result, location) in parsed.items() if location is None and result["nvdb_reference"]}
+    objects = {query: future.result() for query, future in futures.items()}
+    found = {}
+    for key, (result, location) in parsed.items():
+        if location is None:
+            future = name_futures.get(key)
+            found[key] = (result, _road_names(future.result()) if future else None)
+            continue
+        municipality, prefix, metre = location
+        stretch = (municipality, prefix)
+        datasets = {}
+        for name, _, use_interval in DATASETS:
+            pad = NEARBY_METRES if use_interval else 0
+            datasets[name] = [record for record in objects[(stretch, name)]
+                              if _covers(record, prefix, metre - pad, metre + pad)]
+        names = [record for record in objects[(stretch, "road_name")] if _covers(record, prefix, metre, metre)]
+        found[key] = (_finish_route_data(result, datasets), _road_names(names))
+    return found

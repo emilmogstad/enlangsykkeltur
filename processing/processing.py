@@ -180,6 +180,8 @@ def _lookup_worker(db_path, race_id, digest, lookup_properties):
             municipality = normalize_municipality_number(row["kommunenr"]) if row["kommunenr"] else None
             if row["nvdb_lookup_status"] and not _needs_nvdb(row) and row["nvdb_reference"] == f"{municipality} {reference}":
                 nvdb_cache[(municipality, reference)] = {column: row[column] for column in NVDB_COLUMNS}
+            if reference:
+                names.setdefault((municipality, reference), row["roadname"])
 
         def check_cancelled():
             with _lock:
@@ -194,11 +196,13 @@ def _lookup_worker(db_path, race_id, digest, lookup_properties):
             missing = {}
             for reference, municipality in pairs:
                 municipality, reference = cache_key(reference, municipality)
-                if (municipality, reference) not in nvdb_cache:
+                if (municipality, reference) not in nvdb_cache or (reference and (municipality, reference) not in names):
                     missing[(municipality, reference)] = (reference, municipality)
             found = lookup_route_data_many(session, missing.values(), pool)
             for cached, lookup_key in missing.items():
-                nvdb_cache[cached] = found[lookup_key]
+                nvdb_cache[cached], name = found[lookup_key]
+                if cached[1]:
+                    names.setdefault(cached, name)
 
         def road_details(reference, municipality):
             return nvdb_cache[cache_key(reference, municipality)]
@@ -255,14 +259,7 @@ def _lookup_worker(db_path, race_id, digest, lookup_properties):
                     match = future.result()
                     reference, municipality = match if match else (None, None)
                     matches.append((reference, normalize_municipality_number(municipality) if municipality else None))
-                name_futures = {}
-                for reference, municipality in matches:
-                    if reference and (municipality, reference) not in names and (municipality, reference) not in name_futures:
-                        name_futures[(municipality, reference)] = pool.submit(
-                            lookup.lookup_roadname, session, reference, municipality)
                 fetch_road_details(session, pool, matches)
-                for name_key, future in name_futures.items():
-                    names[name_key] = future.result()
                 for index, (reference, municipality), property_future in zip(indices, matches, property_futures):
                     point = points.iloc[index]
                     property_number_value = property_future.result() if property_future else None

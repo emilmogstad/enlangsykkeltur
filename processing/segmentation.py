@@ -23,15 +23,8 @@ def suggest_segments(
     Labels use smoothed lookup attributes within each half-open section (the last includes the endpoint).
     Names prioritise fully private sections, then protected climbs, then road and municipality.
     """
-    route = route.sort_values("route_order").reset_index(drop=True)
-    if route["route_order"].duplicated().any() or not route["route_order"].isin(profile["route_order"]).all():
-        raise ValueError("Elevation profile and lookup route points must match. Complete lookup and refit elevation.")
-    # Excluded points retain their GPX geometry but do not contribute road attributes.
-    route = route.set_index("route_order").reindex(profile["route_order"]).reset_index()
-    orders = profile["route_order"].to_numpy(dtype=float)
-    distances = profile["distance_cum_km"].to_numpy(dtype=float)
-    if len(orders) < 2:
-        raise ValueError("At least two route points are required for segmentation.")
+    prepared = _prepare(profile, route)
+    route, orders, distances, private_edges = prepared
     turning = extrema.sort_values("route_order")
     if not turning["kind"].isin(["peak", "valley"]).all():
         raise ValueError("Elevation boundaries must be classified as peak or valley.")
@@ -71,8 +64,6 @@ def suggest_segments(
         for order in route.loc[borders, "route_order"].to_numpy(dtype=float):
             add_boundary(float(order), reason)
 
-    private = route["smoothed_vei_id"].astype("string").str.startswith(("P", "S")).fillna(False)
-    private_edges = private.to_numpy(dtype=bool)[1:]
     transitions = np.diff(np.concatenate(([False], private_edges, [False])).astype(int))
     for start, end in zip(np.flatnonzero(transitions == 1), np.flatnonzero(transitions == -1)):
         if distances[end] - distances[start] > 2.0:
@@ -83,11 +74,50 @@ def suggest_segments(
         {"route_order": order, "kind": reason}
         for order, reason in sorted(reasons.items()) if orders[0] < order < orders[-1]
     ], columns=["route_order", "kind"])
-    segments = elevation_segments(profile, boundaries)
     climbs = set(zip(
         categorized.loc[categorized["direction"].eq("Uphill"), "start_route_order"],
         categorized.loc[categorized["direction"].eq("Uphill"), "end_route_order"],
     ))
+    return _describe(profile, prepared, boundaries, climbs)
+
+
+def segment_details(profile: pd.DataFrame, route: pd.DataFrame, segments: pd.DataFrame) -> pd.DataFrame:
+    """Rebuild measurements and lookup labels for saved segments from their start points and the route.
+
+    Saved names, descriptions and boundary reasons are kept.
+    """
+    if segments.empty:
+        return segments
+    saved = segments.sort_values("segment").reset_index(drop=True)
+    starts = saved["start_route_order"].to_numpy(dtype=float)
+    if starts[0] != float(profile["route_order"].min()):
+        raise ValueError("Saved segments do not match the route. Generate the segments again.")
+    boundaries = pd.DataFrame({"route_order": starts[1:], "kind": saved["from"].iloc[1:].to_numpy()})
+    details = _describe(profile, _prepare(profile, route), boundaries, set())
+    labels = ["segment", "segment_name", "from", "to"]
+    details[labels] = saved[labels].to_numpy()
+    details.insert(2, "segment_desc", saved["segment_desc"].to_numpy())
+    return details
+
+
+def _prepare(profile: pd.DataFrame, route: pd.DataFrame):
+    route = route.sort_values("route_order").reset_index(drop=True)
+    if route["route_order"].duplicated().any() or not route["route_order"].isin(profile["route_order"]).all():
+        raise ValueError("Elevation profile and lookup route points must match. Complete lookup and refit elevation.")
+    # Excluded points retain their GPX geometry but do not contribute road attributes.
+    route = route.set_index("route_order").reindex(profile["route_order"]).reset_index()
+    orders = profile["route_order"].to_numpy(dtype=float)
+    distances = profile["distance_cum_km"].to_numpy(dtype=float)
+    if len(orders) < 2:
+        raise ValueError("At least two route points are required for segmentation.")
+    private = route["smoothed_vei_id"].astype("string").str.startswith(("P", "S")).fillna(False)
+    return route, orders, distances, private.to_numpy(dtype=bool)[1:]
+
+
+def _describe(profile: pd.DataFrame, prepared, boundaries: pd.DataFrame, climbs: set) -> pd.DataFrame:
+    """Measure the sections between boundaries and add names, private distance and lookup labels."""
+    route, orders, distances, private_edges = prepared
+    segments = elevation_segments(profile, boundaries)
     label_columns = ("fylke", "kommunename", "politidistrikt", "roadname")
     labels = {column: [] for column in label_columns}
     segment_names = []

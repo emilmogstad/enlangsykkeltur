@@ -155,12 +155,18 @@ def iterative_aic(route: pd.DataFrame, min_points: int = 100, criterion: str = "
     For reassigned points, the donor is the nearer endpoint of the chosen road's segment.
     """
     score, label = CRITERIA[criterion], criterion.upper()
+    original = route
+    # Junction parts (kortform ending in "KD<n> m<n>") are always smoothed away: they belong to no road, so
+    # they never count towards a road or serve as donors, and get the nearest selected road.
+    junction = route["kortform"].astype("string").str.contains(r"\bKD\d+ m\d+$", na=False)
+    route = route.assign(vei_id=route["vei_id"].mask(junction))
     counts = get_count(route)
     eligible = counts.loc[counts["count"] >= 3] if criterion == "bic" else counts
     selected = eligible.loc[eligible["count"] >= min_points, "vei_id"].tolist()
     remaining = eligible.loc[eligible["count"] < min_points, "vei_id"].tolist()
     off_base = ~route["vei_id"].isin(selected).to_numpy()
-    print(f"{off_base.sum()} of {len(route)} points are not on a base road (>= {min_points} points)")
+    print(f"{off_base.sum()} of {len(route)} points are not on a base road (>= {min_points} points); "
+          f"{junction.sum()} junction points are always smoothed")
     best_score, best_nearest = np.inf, None
     if selected:
         best_nearest = distance_to_roads(route, selected)
@@ -179,10 +185,10 @@ def iterative_aic(route: pd.DataFrame, min_points: int = 100, criterion: str = "
             print(f"{label} with {len(candidate)} roads (+{road}): {candidate_score:,.1f} - skipped")
     roads = counts["vei_id"].tolist()
     print(f"Selected {len(selected)} of {len(roads)} roads, {label} {best_score:,.1f}: {selected}")
-    smoothed = route.copy()
+    smoothed = original.copy()
     smoothed["smoothed_source_route_order"] = pd.Series(pd.NA, index=route.index, dtype="Int64")
     if best_nearest is None:
-        smoothed["smoothed_vei_id"] = smoothed["vei_id"]
+        smoothed["smoothed_vei_id"] = route["vei_id"]
         smoothed["smoothing_distance_m"] = np.nan
     else:
         smoothed["smoothed_vei_id"] = best_nearest["closest_vei_id"]
